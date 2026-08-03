@@ -464,6 +464,9 @@ void HashProbe::asyncWaitForHashTable() {
 
   VELOX_CHECK_NOT_NULL(table_);
 
+  antiJoinShortCircuitEnabled_ =
+      isAntiJoin(joinType_) && filter_ && !nullAware_;
+
   maybeSetupSpillInputReader(hashBuildResult->restoredPartitionId);
   maybeSetupInputSpiller(hashBuildResult->spillPartitionIds);
   checkMaxSpillLevel(hashBuildResult->restoredPartitionId);
@@ -1271,6 +1274,25 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
           ++numOut;
         }
       }
+    } else if (antiJoinShortCircuitEnabled_) {
+      // Short-circuit chain walk: evaluate filter one entry at a time and skip
+      // remaining entries once any match passes.
+      numOut = probeAntiJoinWithFilterShortCircuit(
+          outputBatchSize, mapping.data(), outputTableRows);
+      if (numOut == 0 && antiJoinChainState_.empty()) {
+        input_ = nullptr;
+        return nullptr;
+      }
+      if (numOut > 0) {
+        fillOutput(numOut);
+        input_ = nullptr;
+        return output_;
+      }
+      // numOut == 0 but still have pending rows — loop back.
+      if (!toSpillOutput && shouldYield()) {
+        return nullptr;
+      }
+      continue;
     } else {
       numOut = table_->listJoinResults(
           *resultIter_,
@@ -1337,6 +1359,107 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
     }
     return output_;
   }
+}
+
+int32_t HashProbe::probeAntiJoinWithFilterShortCircuit(
+    vector_size_t outputBatchSize,
+    vector_size_t* mapping,
+    char** outputTableRows) {
+  const auto inputSize = input_->size();
+  const auto nextOffset = table_->rows()->nextOffset();
+  int32_t numOut = 0;
+
+  // Follows the next-row pointer in the duplicate chain. Returns nullptr when
+  // the chain is exhausted or nextOffset is not set.
+  auto followChain = [nextOffset](char* row) -> char* {
+    if (nextOffset == 0 || row == nullptr) {
+      return nullptr;
+    }
+    return *reinterpret_cast<char**>(row + nextOffset);
+  };
+
+  // Initialize chain state on first entry for this input batch.
+  if (antiJoinChainState_.empty()) {
+    antiJoinChainState_.resize(inputSize, nullptr);
+    antiJoinPendingRows_.resizeFill(inputSize, false);
+
+    for (vector_size_t i = 0; i < inputSize; ++i) {
+      if (activeRows_.isValid(i) && lookup_->hits[i]) {
+        antiJoinChainState_[i] = lookup_->hits[i];
+        antiJoinPendingRows_.setValid(i, true);
+      } else {
+        if (FOLLY_LIKELY(numOut < outputBatchSize)) {
+          mapping[numOut] = i;
+          outputTableRows[numOut] = nullptr;
+          ++numOut;
+        }
+      }
+    }
+    antiJoinPendingRows_.updateBounds();
+
+    if (numOut > 0 || !antiJoinPendingRows_.hasSelections()) {
+      if (!antiJoinPendingRows_.hasSelections()) {
+        antiJoinChainState_.clear();
+      }
+      return numOut;
+    }
+  }
+
+  // Build a batch with one chain entry per pending row for filter evaluation.
+  auto* rawMapping = outputRowMapping_->asMutable<vector_size_t>();
+  auto* outTableRows = outputTableRows_->asMutable<char*>();
+  int32_t batchSize = 0;
+
+  antiJoinPendingRows_.applyToSelected([&](auto row) {
+    if (batchSize >= outputBatchSize) {
+      return;
+    }
+    rawMapping[batchSize] = row;
+    outTableRows[batchSize] = antiJoinChainState_[row];
+    antiJoinChainState_[row] = followChain(antiJoinChainState_[row]);
+    ++batchSize;
+  });
+
+  if (batchSize == 0) {
+    antiJoinChainState_.clear();
+    return 0;
+  }
+
+  // Evaluate filter on this batch.
+  filterInputRows_.resizeFill(batchSize);
+  RowVectorPtr filterInput = createFilterInput(batchSize);
+  EvalCtx evalCtx(operatorCtx_->execCtx(), filter_.get(), filterInput.get());
+  filter_->eval(0, 1, true, filterInputRows_, evalCtx, filterResult_);
+  decodedFilterResult_.decode(*filterResult_[0], filterInputRows_);
+
+  for (int32_t i = 0; i < batchSize; ++i) {
+    const auto probeRow = rawMapping[i];
+    const bool filterPassed = filterInputRows_.isValid(i) &&
+        !decodedFilterResult_.isNullAt(i) &&
+        decodedFilterResult_.valueAt<bool>(i);
+
+    if (filterPassed) {
+      // Match passes filter — exclude this probe row from anti-join output.
+      antiJoinPendingRows_.setValid(probeRow, false);
+      antiJoinChainState_[probeRow] = nullptr;
+    } else if (antiJoinChainState_[probeRow] == nullptr) {
+      // Chain exhausted with no passing match — emit as anti-join miss.
+      antiJoinPendingRows_.setValid(probeRow, false);
+      if (numOut < outputBatchSize) {
+        mapping[numOut] = probeRow;
+        outputTableRows[numOut] = nullptr;
+        ++numOut;
+      }
+    }
+  }
+
+  antiJoinPendingRows_.updateBounds();
+
+  if (!antiJoinPendingRows_.hasSelections()) {
+    antiJoinChainState_.clear();
+  }
+
+  return numOut;
 }
 
 bool HashProbe::maybeReadSpillOutput() {

@@ -158,6 +158,16 @@ class HashProbe : public Operator {
   // arbitration.
   RowVectorPtr getOutputInternal(bool toSpillOutput);
 
+  /// Specialized probe loop for anti-join with filter (non-null-aware).
+  /// Instead of walking entire hash chains before evaluating the filter, this
+  /// processes one chain entry at a time per probe row and short-circuits the
+  /// remaining chain once a passing match is found (excluding the probe row
+  /// from output). Returns the number of output rows written.
+  int32_t probeAntiJoinWithFilterShortCircuit(
+      vector_size_t outputBatchSize,
+      vector_size_t* mapping,
+      char** outputTableRows);
+
   // Handles the right semi filter join fast path when there is no extra
   // filter. Marks matching build rows as probed and consumes the current
   // input batch.
@@ -683,6 +693,17 @@ class HashProbe : public Operator {
   // Keeps track of returned results between successive batches of
   // output for a batch of input.
   std::unique_ptr<BaseHashTable::JoinResultIterator> resultIter_;
+
+  /// Whether the anti-join short-circuit optimization is active for the current
+  /// build table. Enabled for non-null-aware anti-join with filter.
+  bool antiJoinShortCircuitEnabled_{false};
+
+  /// Per-probe-row chain pointer for the short-circuit path. Rows with nullptr
+  /// have been decided (excluded from output) or had no match.
+  std::vector<char*> antiJoinChainState_;
+
+  /// Rows still pending examination in the short-circuit path.
+  SelectivityVector antiJoinPendingRows_;
 
   RowVectorPtr output_;
 
