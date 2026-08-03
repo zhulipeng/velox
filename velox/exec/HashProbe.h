@@ -158,11 +158,11 @@ class HashProbe : public Operator {
   // arbitration.
   RowVectorPtr getOutputInternal(bool toSpillOutput);
 
-  /// Specialized probe loop for anti-join with filter (non-null-aware).
-  /// Instead of walking entire hash chains before evaluating the filter, this
-  /// processes one chain entry at a time per probe row and short-circuits the
-  /// remaining chain once a passing match is found (excluding the probe row
-  /// from output). Returns the number of output rows written.
+  // Specialized probe loop for anti-join with filter (non-null-aware).
+  // Instead of walking entire hash chains before evaluating the filter, this
+  // processes one chain entry at a time per probe row and short-circuits the
+  // remaining chain once a passing match is found (excluding the probe row
+  // from output). Returns the number of output rows written.
   int32_t probeAntiJoinWithFilterShortCircuit(
       vector_size_t outputBatchSize,
       vector_size_t* mapping,
@@ -694,16 +694,21 @@ class HashProbe : public Operator {
   // output for a batch of input.
   std::unique_ptr<BaseHashTable::JoinResultIterator> resultIter_;
 
-  /// Whether the anti-join short-circuit optimization is active for the current
-  /// build table. Enabled for non-null-aware anti-join with filter.
+  // Whether the anti-join short-circuit optimization is active for the current
+  // build table. Enabled for non-null-aware anti-join with filter.
   bool antiJoinShortCircuitEnabled_{false};
 
-  /// Per-probe-row chain pointer for the short-circuit path. Rows with nullptr
-  /// have been decided (excluded from output) or had no match.
+  // Per-probe-row chain pointer for the short-circuit path. Rows with nullptr
+  // have been decided (excluded from output) or had no match.
   std::vector<char*> antiJoinChainState_;
 
-  /// Rows still pending examination in the short-circuit path.
+  // Rows still pending examination in the short-circuit path.
   SelectivityVector antiJoinPendingRows_;
+
+  // Cursor for the initialization phase of the short-circuit path. Tracks the
+  // next probe row to examine when emitting no-match rows overflows the output
+  // batch.
+  vector_size_t antiJoinInitRow_{0};
 
   RowVectorPtr output_;
 

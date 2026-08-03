@@ -1284,8 +1284,16 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
         return nullptr;
       }
       if (numOut > 0) {
+        if (!toSpillOutput) {
+          ensureLazyInputLoaded();
+          if (input_ == nullptr) {
+            return nullptr;
+          }
+        }
         fillOutput(numOut);
-        input_ = nullptr;
+        if (antiJoinChainState_.empty()) {
+          input_ = nullptr;
+        }
         return output_;
       }
       // numOut == 0 but still have pending rows — loop back.
@@ -1378,29 +1386,40 @@ int32_t HashProbe::probeAntiJoinWithFilterShortCircuit(
     return *reinterpret_cast<char**>(row + nextOffset);
   };
 
-  // Initialize chain state on first entry for this input batch.
+  // Initialize chain state on first entry for this input batch, or continue
+  // emitting no-match rows from a prior overflow.
   if (antiJoinChainState_.empty()) {
     antiJoinChainState_.resize(inputSize, nullptr);
     antiJoinPendingRows_.resizeFill(inputSize, false);
+    antiJoinInitRow_ = 0;
+  }
 
-    for (vector_size_t i = 0; i < inputSize; ++i) {
-      if (activeRows_.isValid(i) && lookup_->hits[i]) {
-        antiJoinChainState_[i] = lookup_->hits[i];
-        antiJoinPendingRows_.setValid(i, true);
+  // Emit no-match rows (probe rows with no hash hit) and populate chain state
+  // for rows that have hits. Uses antiJoinInitRow_ as a cursor so that overflow
+  // across output batches is handled correctly.
+  if (antiJoinInitRow_ < inputSize) {
+    for (; antiJoinInitRow_ < inputSize; ++antiJoinInitRow_) {
+      if (activeRows_.isValid(antiJoinInitRow_) &&
+          lookup_->hits[antiJoinInitRow_]) {
+        antiJoinChainState_[antiJoinInitRow_] =
+            lookup_->hits[antiJoinInitRow_];
+        antiJoinPendingRows_.setValid(antiJoinInitRow_, true);
       } else {
-        if (FOLLY_LIKELY(numOut < outputBatchSize)) {
-          mapping[numOut] = i;
-          outputTableRows[numOut] = nullptr;
-          ++numOut;
+        if (numOut >= outputBatchSize) {
+          break;
         }
+        mapping[numOut] = antiJoinInitRow_;
+        outputTableRows[numOut] = nullptr;
+        ++numOut;
       }
     }
     antiJoinPendingRows_.updateBounds();
 
-    if (numOut > 0 || !antiJoinPendingRows_.hasSelections()) {
-      if (!antiJoinPendingRows_.hasSelections()) {
-        antiJoinChainState_.clear();
-      }
+    if (numOut > 0 || antiJoinInitRow_ < inputSize) {
+      return numOut;
+    }
+    if (!antiJoinPendingRows_.hasSelections()) {
+      antiJoinChainState_.clear();
       return numOut;
     }
   }
@@ -1410,14 +1429,12 @@ int32_t HashProbe::probeAntiJoinWithFilterShortCircuit(
   auto* outTableRows = outputTableRows_->asMutable<char*>();
   int32_t batchSize = 0;
 
-  antiJoinPendingRows_.applyToSelected([&](auto row) {
-    if (batchSize >= outputBatchSize) {
-      return;
-    }
+  antiJoinPendingRows_.testSelected([&](auto row) {
     rawMapping[batchSize] = row;
     outTableRows[batchSize] = antiJoinChainState_[row];
     antiJoinChainState_[row] = followChain(antiJoinChainState_[row]);
     ++batchSize;
+    return batchSize < outputBatchSize;
   });
 
   if (batchSize == 0) {
